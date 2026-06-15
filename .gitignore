@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+*.db
+node_modules/
+dist/
+*.tsbuildinfo
+storage/uploads/*
+storage/previews/*
+storage/generated/*
+storage/chroma/
+!storage/uploads/.gitkeep
+!storage/previews/.gitkeep
+!storage/generated/.gitkeep
