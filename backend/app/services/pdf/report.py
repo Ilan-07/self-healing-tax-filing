@@ -8,7 +8,7 @@ import fitz
 from reportlab.graphics.barcode.qr import QrCodeWidget
 from reportlab.graphics.shapes import Drawing
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import (
@@ -133,28 +133,40 @@ class PDFReportService:
             Spacer(1, 0.10 * inch),
         ]
 
+        total_credits = (
+            calc.nonrefundable_credits
+            + calc.earned_income_credit
+            + calc.refundable_child_tax_credit
+            + calc.refundable_education_credit
+        )
         income = self._money_card(
             "4. INCOME SUMMARY",
             [
                 ("W-2 Wages", data.wages),
-                ("Other Income", data.other_income),
-                ("Total Income", calc.gross_income),
+                ("Interest & Dividends", data.taxable_interest + data.ordinary_dividends),
+                ("Capital Gains", data.long_term_capital_gain + data.short_term_capital_gain),
+                ("Self-Employment", data.self_employment_income),
+                ("Taxable Social Security", calc.taxable_social_security),
+                ("Other Income", data.taxable_pension_ira + data.partnership_income + data.other_income),
+                ("Total Income", calc.total_income),
             ],
             styles,
-            total_rows={2},
+            total_rows={6},
             width=3.55 * inch,
         )
         deductions = self._money_card(
             "6. DEDUCTIONS & CREDITS SUMMARY",
             [
                 ("Standard Deduction", calc.standard_deduction),
-                ("Itemized Deductions", data.itemized_deductions),
+                ("QBI Deduction", calc.qbi_deduction),
                 ("Total Deductions", calc.deductions),
-                ("Tax Credits", 0),
-                ("Total Credits", 0),
+                ("Child Tax Credit", calc.child_tax_credit + calc.refundable_child_tax_credit),
+                ("Education / Saver's Credit", calc.education_credits + calc.savers_credit + calc.refundable_education_credit),
+                ("Earned Income Credit", calc.earned_income_credit),
+                ("Total Credits", total_credits),
             ],
             styles,
-            total_rows={2, 4},
+            total_rows={2, 6},
             width=3.55 * inch,
         )
         left = Table(
@@ -165,19 +177,23 @@ class PDFReportService:
         calculation = self._money_card(
             "5. TAX CALCULATION BREAKDOWN",
             [
-                ("Gross Income", calc.gross_income),
-                ("Adjustments to Income", 0),
-                ("Adjusted Gross Income (AGI)", calc.gross_income),
-                ("Standard / Applied Deduction", -calc.deductions),
+                ("Total Income", calc.total_income),
+                ("Adjustments to Income", -calc.adjustments),
+                ("Adjusted Gross Income (AGI)", calc.adjusted_gross_income),
+                ("Applied Deduction", -calc.deductions),
+                ("QBI Deduction", -calc.qbi_deduction),
                 ("Taxable Income", calc.taxable_income),
+                ("Income Tax", calc.income_tax_before_credits),
+                ("Nonrefundable Credits", -calc.nonrefundable_credits),
+                ("Other Taxes (SE / AMT / NIIT)", calc.other_taxes),
                 ("Federal Tax", calc.federal_tax),
                 ("State Tax Estimate", calc.state_tax),
                 ("Total Tax Liability", calc.total_tax),
-                ("Total Payments", calc.total_withholding),
+                ("Total Payments", calc.total_payments),
                 (balance_label, balance),
             ],
             styles,
-            total_rows={2, 4, 7, 9},
+            total_rows={2, 5, 9, 11},
             width=4.55 * inch,
             highlight_last=True,
         )

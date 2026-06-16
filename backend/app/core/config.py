@@ -15,9 +15,21 @@ class Settings(BaseSettings):
     storage_root: Path = Path("../storage")
     verification_threshold: float = 0.95
     max_remediation_attempts: int = 2
-    default_state_tax_rate: float = 0.05
+    # State income tax is intentionally opt-in: a single flat rate cannot model
+    # 40+ state systems honestly, so it stays 0 unless explicitly configured.
+    default_state_tax_rate: float = 0.0
+    # E-file boundary: no public IRS API exists. "pdf" produces a self-file
+    # package; "mock_transmitter" simulates a commercial MeF transmitter.
+    efile_backend: str = "pdf"
+    # W-2 extractor: "label" (offline parser) or "azure" (Document Intelligence).
+    w2_extractor: str = "label"
+    azure_di_endpoint: str = ""
+    azure_di_key: str = ""
     tesseract_cmd: str | None = None
     allowed_origins: str = "http://localhost:5173"
+    # API key for write/read endpoints; empty disables auth (local dev only).
+    api_key: str = ""
+    log_level: str = "INFO"
 
     model_config = SettingsConfigDict(
         env_file=".env",

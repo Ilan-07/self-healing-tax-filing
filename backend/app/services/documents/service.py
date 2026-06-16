@@ -18,19 +18,20 @@ class DocumentPage:
 
 
 class DocumentService:
-    def load(self, path: Path) -> list[DocumentPage]:
+    def load(self, path: Path, scale: int = 2) -> list[DocumentPage]:
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             raise ValueError(f"Unsupported document type: {path.suffix}")
         if path.suffix.lower() == ".pdf":
-            return self._load_pdf(path)
+            return self._load_pdf(path, scale)
         image = Image.open(path).convert("RGB")
         return [DocumentPage(number=1, image=image)]
 
-    def _load_pdf(self, path: Path) -> list[DocumentPage]:
+    def _load_pdf(self, path: Path, scale: int = 2) -> list[DocumentPage]:
         pages: list[DocumentPage] = []
         with fitz.open(path) as document:
             for index, page in enumerate(document):
-                pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                matrix = fitz.Matrix(scale, scale)
+                pixmap = page.get_pixmap(matrix=matrix, alpha=False)
                 image = Image.frombytes(
                     "RGB", (pixmap.width, pixmap.height), pixmap.samples
                 )

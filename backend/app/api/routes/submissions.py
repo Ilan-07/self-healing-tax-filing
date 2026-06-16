@@ -4,63 +4,104 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+)
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
+from app.api.dependencies.auth import require_api_key
 from app.api.dependencies.services import get_storage, get_workflow
-from app.db.session import get_db
+from app.core.logging import get_logger
+from app.db.session import SessionLocal, get_db
 from app.models.submission import SubmissionRecord
 from app.repositories.submissions import SubmissionRepository
 from app.schemas import SubmissionResult
 from app.services.documents.service import SUPPORTED_EXTENSIONS
 from app.services.storage.service import StorageService
-from app.workflow.graph import TaxWorkflow
 
-
+logger = get_logger(__name__)
 router = APIRouter(prefix="/submissions", tags=["submissions"])
 
 
-@router.post("", response_model=SubmissionResult)
-async def create_submission(
-    document: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    storage: StorageService = Depends(get_storage),
-    workflow: TaxWorkflow = Depends(get_workflow),
-):
-    suffix = Path(document.filename or "").suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(415, "Upload a PDF, PNG, JPG, or JPEG document")
-    submission_id = str(uuid4())
-    upload_path = await storage.save_upload(submission_id, document)
-    report_path = storage.report_path(submission_id)
-    repository = SubmissionRepository(db)
-    record = repository.create(
-        SubmissionRecord(
-            id=submission_id,
-            original_filename=document.filename or upload_path.name,
-            upload_path=str(upload_path),
-            report_path=str(report_path),
-            status="parsing",
-        )
-    )
-    state = workflow.run(
+def _run_workflow(
+    submission_id: str,
+    original_filename: str,
+    upload_paths: list[str],
+    report_path: str,
+) -> None:
+    """Run the agent pipeline off the request path; persist the result."""
+    logger.info("processing submission %s (%d docs)", submission_id, len(upload_paths))
+    state = get_workflow().run(
         {
             "submission_id": submission_id,
-            "original_filename": record.original_filename,
-            "upload_path": str(upload_path),
-            "report_path": str(report_path),
+            "original_filename": original_filename,
+            "upload_path": upload_paths[0],
+            "upload_paths": upload_paths,
+            "report_path": report_path,
             "status": "parsing",
             "audit_trail": [],
             "remediation_attempts": 0,
         }
     )
-    repository.save_result(record, state)
-    return _to_result(record, state)
+    db = SessionLocal()
+    try:
+        record = SubmissionRepository(db).get(submission_id)
+        if record:
+            SubmissionRepository(db).save_result(record, state)
+    finally:
+        db.close()
+    logger.info("submission %s finished: %s", submission_id, state.get("status"))
+
+
+@router.post("", response_model=SubmissionResult, status_code=202)
+async def create_submission(
+    background: BackgroundTasks,
+    documents: list[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+    storage: StorageService = Depends(get_storage),
+    _: None = Depends(require_api_key),
+):
+    if not documents:
+        raise HTTPException(422, "Upload at least one document")
+    for doc in documents:
+        if Path(doc.filename or "").suffix.lower() not in SUPPORTED_EXTENSIONS:
+            raise HTTPException(415, "Upload PDF, PNG, JPG, or JPEG documents")
+    submission_id = str(uuid4())
+    upload_paths = [
+        str(await storage.save_upload(submission_id, doc)) for doc in documents
+    ]
+    original_filename = ", ".join(
+        doc.filename or Path(p).name for doc, p in zip(documents, upload_paths)
+    )
+    report_path = storage.report_path(submission_id)
+    record = SubmissionRepository(db).create(
+        SubmissionRecord(
+            id=submission_id,
+            original_filename=original_filename,
+            upload_path=upload_paths[0],
+            report_path=str(report_path),
+            status="processing",
+        )
+    )
+    # Non-blocking: the pipeline runs after the response; clients poll GET.
+    background.add_task(
+        _run_workflow, submission_id, original_filename, upload_paths, str(report_path)
+    )
+    return _to_result(record, {"status": "processing"})
 
 
 @router.get("/{submission_id}", response_model=SubmissionResult)
-def get_submission(submission_id: str, db: Session = Depends(get_db)):
+def get_submission(
+    submission_id: str,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_api_key),
+):
     record = SubmissionRepository(db).get(submission_id)
     if not record:
         raise HTTPException(404, "Submission not found")
@@ -69,7 +110,11 @@ def get_submission(submission_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/{submission_id}/report")
-def download_report(submission_id: str, db: Session = Depends(get_db)):
+def download_report(
+    submission_id: str,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_api_key),
+):
     record = SubmissionRepository(db).get(submission_id)
     if not record or record.status != "completed" or not record.report_path:
         raise HTTPException(404, "Completed report not found")

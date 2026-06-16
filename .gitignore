@@ -13,3 +13,6 @@ storage/chroma/
 !storage/uploads/.gitkeep
 !storage/previews/.gitkeep
 !storage/generated/.gitkeep
+
+# OS cruft
+.DS_Store

@@ -9,9 +9,11 @@ from app.agents.verification.agent import VerificationAgent
 from app.core.config import get_settings
 from app.services.documents.service import DocumentService
 from app.services.chroma.service import ChromaService
+from app.services.efile import get_backend
+from app.services.extraction import get_w2_extractor
 from app.services.ocr.service import OCRService
 from app.services.ollama.client import OllamaClient
-from app.services.pdf.report import PDFReportService
+from app.services.pdf.professional_report import ProfessionalReportService
 from app.services.storage.service import StorageService
 from app.workflow.graph import TaxWorkflow
 
@@ -37,12 +39,19 @@ def get_workflow() -> TaxWorkflow:
             ollama,
             settings.default_state_tax_rate,
             ChromaService(settings.chroma_path),
+            w2_extractor=get_w2_extractor(
+                settings.w2_extractor,
+                azure_endpoint=settings.azure_di_endpoint,
+                azure_key=settings.azure_di_key,
+            ),
         ),
         processing=TaxProcessingAgent(calculator),
         verification=VerificationAgent(
             calculator, settings.verification_threshold
         ),
         remediation=RemediationAgent(ollama),
-        documentation=DocumentationAgent(PDFReportService()),
+        documentation=DocumentationAgent(
+            ProfessionalReportService(), get_backend(settings.efile_backend)
+        ),
         max_attempts=settings.max_remediation_attempts,
     )

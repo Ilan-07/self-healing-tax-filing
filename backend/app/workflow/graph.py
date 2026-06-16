@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.documentation.agent import DocumentationAgent
@@ -7,7 +10,12 @@ from app.agents.reading.agent import ReadingAgent
 from app.agents.remediation.agent import RemediationAgent
 from app.agents.tax_processing.agent import TaxProcessingAgent
 from app.agents.verification.agent import VerificationAgent
-from app.schemas import SubmissionResult, TaxCalculation, TaxpayerData, VerificationResult
+from app.schemas import (
+    SubmissionResult,
+    TaxCalculation,
+    TaxpayerData,
+    VerificationResult,
+)
 from app.workflow.state import TaxWorkflowState
 
 
@@ -49,21 +57,31 @@ class TaxWorkflow:
                 "manual_review": "manual_review",
             },
         )
-        graph.add_edge("remediate", "calculate")
+        graph.add_conditional_edges(
+            "remediate",
+            self._route_remediation,
+            {"parse": "parse", "calculate": "calculate"},
+        )
         graph.add_edge("document", END)
         graph.add_edge("manual_review", END)
-        return graph.compile()
+        # Checkpointer makes graph runs resumable / inspectable per submission.
+        return graph.compile(checkpointer=MemorySaver())
 
     def run(self, state: TaxWorkflowState) -> TaxWorkflowState:
+        config = {"configurable": {"thread_id": state["submission_id"]}}
         try:
-            return self.graph.invoke(state)
+            return self.graph.invoke(state, config=config)
         except Exception as exc:
             return {**state, "status": "failed", "error": str(exc)}
 
     def _parse(self, state):
-        data, raw_text, logs = self.reading.run(
-            __import__("pathlib").Path(state["upload_path"])
-        )
+        # Re-extraction passes render the document at a higher resolution.
+        scale = 2 + state.get("reextraction_passes", 0)
+        paths = [
+            Path(p)
+            for p in state.get("upload_paths") or [state["upload_path"]]
+        ]
+        data, raw_text, logs = self.reading.run_many(paths, scale=scale)
         return {
             "status": "calculating",
             "extracted_data": data.model_dump(mode="json"),
@@ -87,6 +105,7 @@ class TaxWorkflow:
         result, log = self.verifier.run(
             TaxpayerData.model_validate(state["extracted_data"]),
             TaxCalculation.model_validate(state["calculation"]),
+            transcript=state.get("transcript"),
         )
         return {
             "verification": result.model_dump(mode="json"),
@@ -102,15 +121,23 @@ class TaxWorkflow:
             return "remediate"
         return "manual_review"
 
+    def _route_remediation(self, state):
+        return "parse" if state.get("needs_reextraction") else "calculate"
+
     def _remediate(self, state):
-        data, log = self.remediation.run(
+        data, needs_reextraction, log = self.remediation.run(
             TaxpayerData.model_validate(state["extracted_data"]),
             VerificationResult.model_validate(state["verification"]),
+        )
+        passes = state.get("reextraction_passes", 0) + (
+            1 if needs_reextraction else 0
         )
         return {
             "status": "remediating",
             "extracted_data": data.model_dump(mode="json"),
             "remediation_attempts": state.get("remediation_attempts", 0) + 1,
+            "needs_reextraction": needs_reextraction,
+            "reextraction_passes": passes,
             "audit_trail": state.get("audit_trail", [])
             + [log.model_dump(mode="json")],
         }
@@ -129,8 +156,8 @@ class TaxWorkflow:
         )
         receipt, path, log = self.documentation.run(
             result,
-            __import__("pathlib").Path(state["report_path"]),
-            __import__("pathlib").Path(state["upload_path"]),
+            Path(state["report_path"]),
+            Path(state["upload_path"]),
         )
         return {
             "status": "completed",

@@ -1,8 +1,12 @@
 import type { SubmissionResult } from "../types/tax";
 
-export async function submitDocument(file: File): Promise<SubmissionResult> {
+export async function submitDocument(
+  files: File | File[],
+): Promise<SubmissionResult> {
   const body = new FormData();
-  body.append("document", file);
+  for (const file of Array.isArray(files) ? files : [files]) {
+    body.append("documents", file);
+  }
   const response = await fetch("/api/v1/submissions", {
     method: "POST",
     body,

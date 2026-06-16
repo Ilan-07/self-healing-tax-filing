@@ -8,7 +8,9 @@ from app.schemas.tax import (
     TaxpayerData,
     VerificationCheck,
     VerificationResult,
+    W2,
     WorkflowStatus,
+    mask_ssn,
 )
 
 __all__ = [
@@ -21,5 +23,7 @@ __all__ = [
     "TaxpayerData",
     "VerificationCheck",
     "VerificationResult",
+    "W2",
     "WorkflowStatus",
+    "mask_ssn",
 ]

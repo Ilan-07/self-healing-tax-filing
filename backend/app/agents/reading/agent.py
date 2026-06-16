@@ -5,12 +5,14 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from app.schemas import AuditEntry, SourceEvidence, TaxpayerData
+from app.schemas import AuditEntry, SourceEvidence, TaxpayerData, mask_ssn
 from app.services.chroma.service import ChromaService
 from app.services.documents.service import DocumentService
+from app.services.extraction import LabelAnchoredW2Parser, ParsedW2, W2Extractor
+from app.services.extraction.base import BOX_TO_TAXPAYER_FIELD
+from app.services.extraction.info_returns import extract_information_returns
 from app.services.ocr.service import OCRService
 from app.services.ollama.client import OllamaClient
-from PIL import Image
 
 
 MONEY_PATTERNS = {
@@ -36,20 +38,104 @@ class ReadingAgent:
         ollama: OllamaClient,
         default_state_tax_rate: float,
         memory: ChromaService | None = None,
+        w2_extractor: W2Extractor | None = None,
     ):
         self.documents = documents
         self.ocr = ocr
         self.ollama = ollama
         self.default_state_tax_rate = default_state_tax_rate
         self.memory = memory
+        self.w2_extractor = w2_extractor or LabelAnchoredW2Parser()
 
-    def run(self, path: Path) -> tuple[TaxpayerData, str, list[AuditEntry]]:
-        pages = self.documents.load(path)
+    # Income fields that are summed when merging multiple uploaded documents.
+    _SUM_FIELDS = (
+        "taxable_interest",
+        "tax_exempt_interest",
+        "ordinary_dividends",
+        "qualified_dividends",
+        "long_term_capital_gain",
+        "short_term_capital_gain",
+        "self_employment_income",
+        "other_income",
+        "adjustments",
+        "itemized_deductions",
+        "estimated_payments",
+        "qualified_tuition",
+        "retirement_contributions",
+        "amt_preference_items",
+    )
+
+    def run_many(
+        self, paths: list[Path], scale: int = 2
+    ) -> tuple[TaxpayerData, str, list[AuditEntry]]:
+        """Read several documents and merge them into one taxpayer return.
+
+        W-2s are concatenated (then re-aggregated for the excess-SS credit) and
+        income line items are summed, so a taxpayer can upload multiple forms.
+        """
+        datas: list[TaxpayerData] = []
+        texts: list[str] = []
+        logs: list[AuditEntry] = []
+        for path in paths:
+            data, text, page_logs = self.run(path, scale=scale)
+            datas.append(data)
+            texts.append(text)
+            logs.extend(page_logs)
+        merged = self._merge(datas)
+        if len(datas) > 1:
+            logs.append(
+                AuditEntry(
+                    agent=self.name,
+                    action="merge_documents",
+                    reason="Combine W-2s and income across uploaded documents",
+                    details={
+                        "documents": len(datas),
+                        "employer_count": merged.employer_count,
+                    },
+                )
+            )
+        return merged, "\n".join(texts), logs
+
+    def _merge(self, datas: list[TaxpayerData]) -> TaxpayerData:
+        if len(datas) == 1:
+            return datas[0]
+        merged = datas[0].model_copy(deep=True)
+        merged.w2s = [w2 for d in datas for w2 in d.w2s]
+        for field in self._SUM_FIELDS:
+            merged_value = sum(
+                (getattr(d, field) for d in datas[1:]), getattr(merged, field)
+            )
+            setattr(merged, field, merged_value)
+        for d in datas[1:]:
+            merged.evidence.extend(d.evidence)
+            for key, value in d.field_confidence.items():
+                merged.field_confidence[key] = max(
+                    merged.field_confidence.get(key, 0.0), value
+                )
+            # Identity / return-level fields: fill from later docs if missing.
+            merged.employee_name = merged.employee_name or d.employee_name
+            merged.ssn = merged.ssn or d.ssn
+            merged.qualifying_children = max(
+                merged.qualifying_children, d.qualifying_children
+            )
+            merged.other_dependents = max(
+                merged.other_dependents, d.other_dependents
+            )
+            merged.aotc_students = max(merged.aotc_students, d.aotc_students)
+        merged.aggregate_w2s()
+        return merged
+
+    def run(
+        self, path: Path, scale: int = 2
+    ) -> tuple[TaxpayerData, str, list[AuditEntry]]:
+        pages = self.documents.load(path, scale=scale)
         merged: dict[str, Any] = {}
         all_text: list[str] = []
         evidence: list[SourceEvidence] = []
         confidences: dict[str, float] = {}
         logs: list[AuditEntry] = []
+        parsed_w2s: list[ParsedW2] = []
+        info_totals: dict[str, tuple[Decimal, float]] = {}
 
         for page in pages:
             image_ocr = self.ocr.extract(page.image, "")
@@ -60,6 +146,12 @@ class ReadingAgent:
                 if value.strip()
             )
             all_text.append(combined_text)
+            # Parse info returns from the single-source page text (not the
+            # OCR+embedded concatenation) so multi-form summing never
+            # double-counts the same document.
+            for field, (value, conf) in extract_information_returns(ocr_text).items():
+                running = info_totals.get(field, (Decimal("0"), conf))
+                info_totals[field] = (running[0] + value, conf)
             vision = self.ollama.extract_tax_fields(page.image, combined_text)
             vision_confidence = vision.get("field_confidence", {})
             for key, value in vision.items():
@@ -68,9 +160,18 @@ class ReadingAgent:
             for field in (
                 "employee_name",
                 "employer_name",
+                "ssn",
                 "wages",
                 "federal_tax_withheld",
                 "state_tax_withheld",
+                "taxable_interest",
+                "ordinary_dividends",
+                "qualified_dividends",
+                "long_term_capital_gain",
+                "short_term_capital_gain",
+                "self_employment_income",
+                "other_income",
+                "itemized_deductions",
             ):
                 if vision.get(field) not in (None, ""):
                     confidence = self._model_confidence(
@@ -99,22 +200,59 @@ class ReadingAgent:
                     },
                 )
             )
-            layout_values, layout_evidence = self._extract_w2_layout(
-                page.image,
-                ocr_text,
-                page.embedded_text,
-                page.number,
+            try:
+                parsed_w2s.extend(
+                    self.w2_extractor.parse(
+                        ocr_text=ocr_text or combined_text, image=page.image
+                    )
+                )
+            except NotImplementedError as exc:
+                logs.append(
+                    AuditEntry(
+                        agent=self.name,
+                        action="extract_w2",
+                        reason="Configured W-2 extractor unavailable",
+                        details={"error": str(exc)},
+                    )
+                )
+
+        # Fold parsed W-2s into the result, collapsing duplicate copies of the
+        # same form (Copy B/C/2) so income is not multiplied.
+        parsed_w2s = _dedupe_w2s([pw for pw in parsed_w2s if _has_w2_data(pw)])
+        if parsed_w2s:
+            merged["w2s"] = [pw.w2.model_dump(mode="json") for pw in parsed_w2s]
+            for pw in parsed_w2s:
+                if pw.ssn:
+                    merged.setdefault("ssn", pw.ssn)
+                if pw.tax_year:
+                    merged.setdefault("tax_year", pw.tax_year)
+                if pw.employee_name:
+                    merged.setdefault("employee_name", pw.employee_name)
+            # Grounding evidence keyed by the taxpayer-level field each box feeds.
+            for box, tp_field in BOX_TO_TAXPAYER_FIELD.items():
+                hits = [pw for pw in parsed_w2s if box in pw.confidences]
+                if hits:
+                    conf = max(pw.confidences[box] for pw in hits)
+                    evidence = [e for e in evidence if e.field != tp_field]
+                    evidence.append(
+                        SourceEvidence(
+                            field=tp_field,
+                            raw_text=str(
+                                sum(getattr(pw.w2, box) for pw in hits)
+                            ),
+                            source=self.w2_extractor.name,
+                            confidence=conf,
+                        )
+                    )
+                    confidences[tp_field] = conf
+            logs.append(
+                AuditEntry(
+                    agent=self.name,
+                    action="extract_w2",
+                    reason=f"W-2 extraction via {self.w2_extractor.name}",
+                    details={"w2_count": len(parsed_w2s)},
+                )
             )
-            for key, value in layout_values.items():
-                merged[key] = value
-            for item in layout_evidence:
-                evidence = [
-                    existing
-                    for existing in evidence
-                    if existing.field != item.field
-                ]
-                evidence.append(item)
-                confidences[item.field] = item.confidence
 
         raw_text = "\n".join(all_text)
         if self.memory:
@@ -133,6 +271,37 @@ class ReadingAgent:
                         details={"error": str(exc)},
                     )
                 )
+        if not merged.get("ssn"):
+            ssn_match = re.search(r"\b(\d{3}-\d{2}-\d{4})\b", raw_text)
+            if ssn_match:
+                merged["ssn"] = ssn_match.group(1)
+                confidences["ssn"] = 0.8
+                evidence.append(
+                    SourceEvidence(
+                        field="ssn",
+                        # Store masked: full SSNs must not leak into the audit log.
+                        raw_text=mask_ssn(ssn_match.group(1)),
+                        source="regex",
+                        confidence=0.8,
+                    )
+                )
+
+        # Typed information returns (1099 family / K-1 / 1098), summed across
+        # forms/pages and grounded like the W-2 boxes. Structured values are
+        # authoritative over the generic vision pass.
+        for field, (value, conf) in info_totals.items():
+            merged[field] = value
+            confidences[field] = conf
+            evidence = [e for e in evidence if e.field != field]
+            evidence.append(
+                SourceEvidence(
+                    field=field,
+                    raw_text=str(value),
+                    source="info-return",
+                    confidence=conf,
+                )
+            )
+
         regex_values = self._regex_extract(raw_text)
         for key, value in regex_values.items():
             if merged.get(key) in (None, ""):
@@ -154,12 +323,18 @@ class ReadingAgent:
             existing_confidence = {}
         merged["field_confidence"] = {**existing_confidence, **confidences}
         data = TaxpayerData.model_validate(merged)
+        # Fold multi-W-2 line items into the scalar wage/withholding totals
+        # (and set employer_count, which drives the excess-SS credit).
+        data.aggregate_w2s()
         logs.append(
             AuditEntry(
                 agent=self.name,
                 action="structure_json",
                 reason="Validate extracted values against the tax data schema",
-                details={"fields": sorted(data.model_dump().keys())},
+                details={
+                    "fields": sorted(data.model_dump().keys()),
+                    "employer_count": data.employer_count,
+                },
             )
         )
         return data, raw_text, logs
@@ -173,167 +348,6 @@ class ReadingAgent:
                     values[field] = Decimal(match.group(1).replace(",", ""))
                     break
         return values
-
-    def _extract_w2_layout(
-        self,
-        image: Image.Image,
-        ocr_text: str,
-        embedded_text: str,
-        page_number: int,
-    ) -> tuple[dict[str, Any], list[SourceEvidence]]:
-        values: dict[str, Any] = {}
-        evidence: list[SourceEvidence] = []
-        lines = [line.strip() for line in ocr_text.splitlines() if line.strip()]
-
-        for line in lines:
-            if re.search(r"\d{2}-\d{7}", line):
-                amounts = re.findall(r"\d[\d,]*\.\s*\d+", line)
-                if len(amounts) >= 2:
-                    values["wages"] = self._decimal(amounts[0])
-                    values["federal_tax_withheld"] = self._decimal(amounts[1])
-                    evidence.extend(
-                        [
-                            self._evidence(
-                                "wages",
-                                amounts[0],
-                                page_number,
-                                "w2-box-1-ocr",
-                                0.90,
-                            ),
-                            self._evidence(
-                                "federal_tax_withheld",
-                                amounts[1],
-                                page_number,
-                                "w2-box-2-ocr",
-                                0.90,
-                            ),
-                        ]
-                    )
-                    break
-
-        employer = self._first_clean_line(
-            self._crop_text(image, (0.02, 0.345, 0.53, 0.45))
-        )
-        if employer:
-            values["employer_name"] = employer
-            evidence.append(
-                self._evidence(
-                    "employer_name",
-                    employer,
-                    page_number,
-                    "w2-employer-region-ocr",
-                    0.96,
-                )
-            )
-
-        employee = self._first_clean_line(
-            self._crop_text(image, (0.02, 0.47, 0.53, 0.60))
-        )
-        if employee:
-            values["employee_name"] = employee
-            evidence.append(
-                self._evidence(
-                    "employee_name",
-                    employee,
-                    page_number,
-                    "w2-employee-region-ocr",
-                    0.95,
-                )
-            )
-
-        state_text = self._crop_text(image, (0.41, 0.58, 0.53, 0.66))
-        state_amounts = [
-            self._decimal(value)
-            for value in re.findall(r"\d[\d,]*\.\s*\d+", state_text)
-        ]
-        if state_amounts:
-            values["state_tax_withheld"] = sum(state_amounts, Decimal("0"))
-            evidence.append(
-                self._evidence(
-                    "state_tax_withheld",
-                    " + ".join(str(value) for value in state_amounts),
-                    page_number,
-                    "w2-box-17-ocr",
-                    0.91,
-                )
-            )
-
-        year_match = re.search(
-            r"Form\s+W-?2[\s\S]{0,80}?\b(20\d{2})\b",
-            embedded_text,
-            flags=re.IGNORECASE,
-        )
-        if not year_match:
-            years = re.findall(r"\b(20\d{2})\b", embedded_text)
-            year_match = re.match(r"(20\d{2})", years[-1]) if years else None
-        if year_match:
-            values["tax_year"] = int(year_match.group(1))
-            evidence.append(
-                self._evidence(
-                    "tax_year",
-                    year_match.group(1),
-                    page_number,
-                    "pdf-text",
-                    0.99,
-                )
-            )
-        return values, evidence
-
-    def _crop_text(
-        self, image: Image.Image, region: tuple[float, float, float, float]
-    ) -> str:
-        width, height = image.size
-        left, top, right, bottom = region
-        crop = image.crop(
-            (
-                int(width * left),
-                int(height * top),
-                int(width * right),
-                int(height * bottom),
-            )
-        )
-        return self.ocr.extract(crop, "").text
-
-    @staticmethod
-    def _first_clean_line(text: str) -> str:
-        rejected = (
-            "employee's",
-            "employer's",
-            "address",
-            "control number",
-            "state",
-            "form w-2",
-        )
-        for line in (item.strip() for item in text.splitlines()):
-            lowered = line.lower()
-            if (
-                line
-                and not any(value in lowered for value in rejected)
-                and not re.search(r"\d{4,}", line)
-                and len(re.findall(r"[A-Za-z]+", line)) >= 2
-            ):
-                return re.sub(r"\s{2,}", " ", line)
-        return ""
-
-    @staticmethod
-    def _decimal(value: str) -> Decimal:
-        return Decimal(re.sub(r"\s+", "", value).replace(",", ""))
-
-    @staticmethod
-    def _evidence(
-        field: str,
-        raw_text: str,
-        page: int,
-        source: str,
-        confidence: float,
-    ) -> SourceEvidence:
-        return SourceEvidence(
-            field=field,
-            page=page,
-            raw_text=raw_text,
-            source=source,
-            confidence=confidence,
-        )
 
     @staticmethod
     def _model_confidence(value: Any, field: str) -> float:
@@ -350,3 +364,36 @@ class ReadingAgent:
         if confidence > 1 and confidence <= 100:
             confidence /= 100
         return min(max(confidence, 0), 1)
+
+
+def _has_w2_data(parsed: ParsedW2) -> bool:
+    """Keep only W-2 segments that actually yielded a wage or withholding box."""
+    return bool(parsed.confidences) and parsed.w2.box1_wages > Decimal("0")
+
+
+_W2_BOXES = (
+    "box1_wages",
+    "box2_federal_withheld",
+    "box3_ss_wages",
+    "box4_ss_withheld",
+    "box5_medicare_wages",
+    "box6_medicare_withheld",
+    "box17_state_withheld",
+)
+
+
+def _w2_filled(w2) -> int:
+    return sum(1 for b in _W2_BOXES if getattr(w2, b) > Decimal("0"))
+
+
+def _dedupe_w2s(parsed: list[ParsedW2]) -> list[ParsedW2]:
+    """Collapse duplicate W-2 copies (Copy B/C/2 of the same form) so income is
+    not multiplied. Copies share an employer EIN and box-1 wages; keep the most
+    complete copy of each. Distinct employers (different EIN) are preserved.
+    """
+    best: dict[tuple[str, object], ParsedW2] = {}
+    for pw in parsed:
+        key = (pw.w2.employer_ein, pw.w2.box1_wages)
+        if key not in best or _w2_filled(pw.w2) > _w2_filled(best[key].w2):
+            best[key] = pw
+    return list(best.values())
