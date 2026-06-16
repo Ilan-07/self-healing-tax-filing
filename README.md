@@ -197,6 +197,39 @@ docker compose up -d
 # then set DATABASE_URL in backend/.env to the postgresql+psycopg URL
 ```
 
+### Optional: Azure Document Intelligence (cloud W-2 extraction)
+
+The W-2 extractor defaults to the offline `label` parser, which needs no cloud
+account. To swap in Azure's `prebuilt-tax.us.w2` model instead, you need an
+**endpoint** and an **API key** from an Azure Document Intelligence (formerly
+"Form Recognizer") resource. To get them:
+
+1. Sign in to the [Azure Portal](https://portal.azure.com) (create a free
+   account if you don't have one — Document Intelligence has a free `F0` tier).
+2. Click **Create a resource**, search for **Document Intelligence** (it may
+   still be listed as **Form Recognizer**), and select **Create**.
+3. Fill in the resource form:
+   - **Subscription** and **Resource group** (create one if needed).
+   - **Region** — pick one near you.
+   - **Name** — a unique name for the resource.
+   - **Pricing tier** — `Free F0` to start, or `Standard S0` for production.
+4. Select **Review + create**, then **Create**, and wait for the deployment to
+   finish.
+5. Open the resource and go to **Keys and Endpoint** in the left sidebar. Copy:
+   - the **Endpoint** (e.g. `https://<your-resource>.cognitiveservices.azure.com/`)
+     → `AZURE_DI_ENDPOINT`
+   - **KEY 1** (or KEY 2) → `AZURE_DI_KEY`
+6. Put them in `backend/.env` and turn the extractor on:
+
+   ```bash
+   W2_EXTRACTOR=azure
+   AZURE_DI_ENDPOINT=https://<your-resource>.cognitiveservices.azure.com/
+   AZURE_DI_KEY=<your-key>
+   ```
+
+Restart the backend to pick up the change. Either key works and they can be
+rotated independently in the portal; keep them out of version control.
+
 ---
 
 ## Configuration
