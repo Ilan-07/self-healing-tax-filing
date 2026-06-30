@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
@@ -56,6 +56,7 @@ class W2(BaseModel):
     box4_ss_withheld: Decimal = Decimal("0")
     box5_medicare_wages: Decimal = Decimal("0")
     box6_medicare_withheld: Decimal = Decimal("0")
+    box15_state: str = ""  # Employer's state (USPS code)
     box17_state_withheld: Decimal = Decimal("0")
 
     @field_validator(
@@ -72,6 +73,11 @@ class W2(BaseModel):
     def _decimal(cls, value: Any) -> Decimal:
         return _to_decimal(value)
 
+    @field_validator("box15_state", mode="before")
+    @classmethod
+    def _state(cls, value: Any) -> str:
+        return normalize_state(value)
+
 
 def _to_decimal(value: Any) -> Decimal:
     if value in (None, ""):
@@ -79,6 +85,49 @@ def _to_decimal(value: Any) -> Decimal:
     if isinstance(value, str):
         value = value.replace("$", "").replace(",", "").strip()
     return Decimal(str(value))
+
+
+_STATE_NAMES = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "DC": "District of Columbia", "FL": "Florida", "GA": "Georgia",
+    "HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana",
+    "IA": "Iowa", "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana",
+    "ME": "Maine", "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan",
+    "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri", "MT": "Montana",
+    "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+    "NM": "New Mexico", "NY": "New York", "NC": "North Carolina",
+    "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon",
+    "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
+    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
+}
+_STATE_CODES = set(_STATE_NAMES)
+_STATE_NAME_TO_CODE = {name.lower(): code for code, name in _STATE_NAMES.items()}
+
+
+def normalize_state(value: Any) -> str:
+    """Normalize a free-text state to a USPS code (e.g. "california" -> "CA").
+
+    Returns "" for empty/None. A recognized two-letter code or full name maps to
+    its canonical code; anything else is upper-cased and passed through (so it
+    simply won't match a rule pack -- a safe no-op rather than a wrong state).
+    """
+    if not value or not isinstance(value, str):
+        return ""
+    v = value.strip()
+    if not v:
+        return ""
+    if len(v) == 2 and v.upper() in _STATE_CODES:
+        return v.upper()
+    key = v.lower().replace(".", "").strip()
+    if key in _STATE_NAME_TO_CODE:
+        return _STATE_NAME_TO_CODE[key]
+    compact = re.sub(r"[^a-z]", "", key)
+    if len(compact) == 2 and compact.upper() in _STATE_CODES:
+        return compact.upper()  # e.g. "D.C." -> "DC"
+    return v.upper()
 
 
 class TaxpayerData(BaseModel):
@@ -95,6 +144,16 @@ class TaxpayerData(BaseModel):
     spouse_65_plus: bool = False
     blind: bool = False
     spouse_blind: bool = False
+    # Exact ages (0 = unknown) for finer state age thresholds (e.g. NY pension
+    # exclusion at 59.5, NJ retirement exclusion at 62). Federal still uses the
+    # 65+ booleans above; these only refine state rule packs.
+    age: int = 0
+    spouse_age: int = 0
+    # Date of birth (optional). When present, state packs use exact age at the
+    # tax year-end (so the 59.5 / "turns 62 this year" boundaries are precise);
+    # otherwise they fall back to ``age`` then the 65+ booleans.
+    birth_date: date | None = None
+    spouse_birth_date: date | None = None
 
     # Dependents
     qualifying_children: int = 0  # CTC-eligible
@@ -141,7 +200,9 @@ class TaxpayerData(BaseModel):
     retirement_contributions: Decimal = Decimal("0")  # Saver's Credit
     amt_preference_items: Decimal = Decimal("0")  # ISO bargain element, PAB, etc.
 
-    # State (intentionally simplistic -- see note in tax_calculator)
+    # State. ``state`` (USPS code) selects an installed rule pack in
+    # ``app.state_rules``; absent a pack, ``state_tax_rate`` is the flat-rate
+    # fallback (default 0 = no state tax). See app.state_rules for the packs.
     state_tax_rate: Decimal = Decimal("0")
     state: str = ""
 
@@ -185,6 +246,11 @@ class TaxpayerData(BaseModel):
     def normalize_decimal(cls, value: Any) -> Decimal:
         return _to_decimal(value)
 
+    @field_validator("state", mode="before")
+    @classmethod
+    def _normalize_state(cls, value: Any) -> str:
+        return normalize_state(value)
+
     @property
     def masked_ssn(self) -> str:
         return mask_ssn(self.ssn)
@@ -214,6 +280,14 @@ class TaxpayerData(BaseModel):
         self.state_tax_withheld = sum(
             (w.box17_state_withheld for w in self.w2s), Decimal("0")
         )
+        # Derive the resident/work state from the W-2s when not already set.
+        # The primary state is the one with the most state tax withheld.
+        if not self.state:
+            with_state = [w for w in self.w2s if w.box15_state]
+            if with_state:
+                self.state = max(
+                    with_state, key=lambda w: w.box17_state_withheld
+                ).box15_state
         self.employer_count = len(self.w2s)
 
 

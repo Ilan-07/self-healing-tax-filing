@@ -14,6 +14,7 @@ def _w2(
     wages: Decimal,
     federal: Decimal,
     state: Decimal = Decimal("0"),
+    state_code: str = "",
 ) -> W2:
     """A W-2 with statutorily-consistent Social Security / Medicare boxes."""
     return W2(
@@ -27,6 +28,7 @@ def _w2(
         box6_medicare_withheld=(wages * Decimal("0.0145")).quantize(
             Decimal("0.01")
         ),
+        box15_state=state_code,
         box17_state_withheld=state,
     )
 
@@ -44,6 +46,7 @@ def synthetic_return(
         wages=Decimal("85000"),
         federal=Decimal("11000"),
         state=Decimal("3500"),
+        state_code="CA",
     )
     data = TaxpayerData(
         employee_name="Jordan Q. Sample",
