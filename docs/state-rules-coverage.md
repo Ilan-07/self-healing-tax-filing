@@ -29,6 +29,21 @@ Two tiers:
     a 2025 oracle; where comparable (2023) our routing lands within a few percent
     and the NJ capital-gains/exclusion fixes track TAXSIM directionally. No
     engine is a perfect oracle — residual inter-engine differences are a few %.
+
+### Layer-1 parameter verification (2026-07)
+
+The 2025 parameters tenforty/OTS uses were backed out and diffed against
+official sources. All four match:
+
+| State | Official 2025 source | Reconciled |
+|-------|----------------------|-----------|
+| CA | FTB 2025 rate schedules + std deduction | std $5,706/$11,412 · $153 exemption credit · all 9 bracket edges (11,079 / 26,264 / … / 371,479) · rates 1–12.3% |
+| NY | tax.ny.gov 2025 std deductions / IT-201-I | single std $8,000 · models the >$107,650 tax-benefit recapture |
+| NJ | NJ-1040 instructions | $1,000 personal exemption · taxes capital gains (routed around the OTS-NJ LTCG bug) |
+| AZ | A.R.S. 43-1011 / AZ DOR | 2.5% flat · std = federal $15,750 (conformed) |
+
+Layer-2 (full-return match vs commercial tax software) remains for NY/NJ/AZ;
+CA is validated by tenforty against professional software.
 - **Reference (`verified=False`)** — hand-encoded brackets, transcribed from
   cited statutes/DOR tables but not reconciled against published returns. Good
   for ballpark; not for filing.
