@@ -21,6 +21,25 @@ from app.schemas import FilingStatus
 Bracket = tuple[Decimal | None, Decimal]
 
 
+def progressive_tax(amount: Decimal, brackets: list[Bracket]) -> Decimal:
+    """Exact progressive tax on ``amount`` over ascending ``(upper, rate)`` bands.
+
+    The final band must be open (``upper is None``). Shared by the federal
+    engine and by state rule packs so the bracket math lives in one place.
+    """
+    tax = Decimal("0")
+    lower = Decimal("0")
+    for upper, rate in brackets:
+        if amount <= lower:
+            break
+        band_top = amount if upper is None else min(amount, upper)
+        tax += (band_top - lower) * rate
+        if upper is None or amount <= upper:
+            break
+        lower = upper
+    return tax
+
+
 @dataclass(frozen=True)
 class CreditParams:
     """Child Tax Credit / Credit for Other Dependents parameters."""

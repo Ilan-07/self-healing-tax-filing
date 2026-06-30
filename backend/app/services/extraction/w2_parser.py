@@ -36,6 +36,10 @@ AMOUNT_INT = re.compile(r"(\d[\d,]{0,15})")
 EIN = re.compile(r"\b(\d{2}-\d{7})\b")
 SSN = re.compile(r"\b(\d{3}-\d{2}-\d{4})\b")
 YEAR = re.compile(r"\b(20\d{2})\b")
+# Box 15 "Employer's state" -- the 2-letter code following the box 15 label.
+STATE_CODE = re.compile(
+    r"(?:\bbox\s*15\b|employer'?s?\s+state)[^A-Za-z]{0,8}([A-Z]{2})\b"
+)
 
 LABEL_CONFIDENCE = 0.9
 BOXNUM_CONFIDENCE = 0.8
@@ -88,7 +92,7 @@ class LabelAnchoredW2Parser:
         return [text[bounds[i] : bounds[i + 1]] for i in range(len(positions))]
 
     def _parse_segment(self, text: str) -> ParsedW2:
-        values: dict[str, Decimal] = {}
+        values: dict[str, Any] = {}
         confidences: dict[str, float] = {}
         for box, patterns in BOX_LABELS.items():
             for index, pattern in enumerate(patterns):
@@ -103,6 +107,9 @@ class LabelAnchoredW2Parser:
         ein_match = EIN.search(text)
         ssn_match = SSN.search(text)
         year_match = YEAR.findall(text)
+        state_match = STATE_CODE.search(text)
+        if state_match:
+            values["box15_state"] = state_match.group(1)
 
         # Positional fallback for real W-2 forms: OCR garbles the box labels and
         # the form layout separates labels from values, so when the labels can't

@@ -95,6 +95,11 @@ execution is resumable and inspectable. The workflow status moves through
   dividends / long-term capital gains** rates; **QBI** (Form 8995, simplified).
 - Credits: **Child Tax Credit / ODC** with phase-out and refundable ACTC;
   refundable **EITC**; **education credits** (AOTC/LLC); **Saver's Credit**.
+- **State income tax** for all 42 taxing states **plus DC**, via a per-state
+  rule-pack registry. **CA, NY, NJ, AZ** are high-accuracy (`verified=True`,
+  delegating to the `tenforty`/OpenTaxSolver engine, parameter-verified against
+  official 2025 schedules); the rest are cited reference packs. See the
+  [State income tax](#state-income-tax) section.
 - Other federal taxes: **self-employment tax**, **Additional Medicare Tax**,
   **NIIT**, **AMT** (Form 6251, simplified), and the **excess Social Security**
   withholding credit.
@@ -105,14 +110,90 @@ execution is resumable and inspectable. The workflow status moves through
 
 **Out of scope (by design)**
 
-- **State income tax** is opt-in and defaults to a `0.0` rate. A single flat rate
-  cannot honestly model 40+ state systems, so it is only applied when explicitly
-  configured. Per-state rule packs are a documented extension point.
+- **State income tax** is now modelled for every taxing state plus DC — see the
+  dedicated [State income tax](#state-income-tax) section below. Still out of
+  scope: **multi-state / part-year** allocation (the engine assigns all income to
+  one resident state) and **local** income taxes (NYC/Yonkers, MD counties, OH/PA
+  municipalities).
 - **Real IRS e-file.** There is no open public e-file API — transmission requires
   the MeF system behind an EFIN/ERO that has passed ATS testing. Filing therefore
   sits behind a swappable adapter: the default `pdf` backend produces a self-file
   package, and `mock_transmitter` simulates a commercial MeF transmitter to
   demonstrate the swap.
+
+---
+
+## State income tax
+
+State income tax is **opt-in** and computed by a per-state *rule-pack* registry
+(`backend/app/state_rules/`), the state-level peer of the federal parameter
+registry. The taxpayer's state is looked up as `(state, year)`; if no pack is
+installed the engine falls back to the flat `state_tax_rate` (default `0.0`).
+The eight states with **no income tax** (AK, FL, NV, SD, TN, TX, WY, WA) simply
+have no pack and yield `$0`.
+
+Full per-state status, sources, and caveats live in
+[`docs/state-rules-coverage.md`](docs/state-rules-coverage.md).
+
+### Two tiers of accuracy
+
+| Tier | States | How it's computed |
+| --- | --- | --- |
+| **High-accuracy** (`verified=True`) | **CA, NY, NJ, AZ** | Delegated to the [`tenforty`](https://github.com/mmacpherson/tenforty) library (OpenTaxSolver engine), which models each state's own income base, deductions, exemptions, and credits. Parameter-verified against official 2025 state schedules and pinned by golden-case tests. |
+| **Reference** (`verified=False`) | the other 38 taxing states + DC | Hand-encoded brackets transcribed from cited statutes / DOR tables. Good for ballpark estimates; **not** reconciled against published returns, so not for filing. |
+
+Every constant follows the same provenance contract as the federal rules: it
+cites a `source` and stays `verified=False` until reconciled. Constants are never
+invented by the LLM.
+
+### How state selection works end-to-end
+
+The taxpayer's state is **derived from the W-2** (box 15), not hand-set:
+
+1. The Azure W-2 extractor and the OCR parser capture the state code; the
+   primary state is the one with the most state tax withheld.
+2. `TaxpayerData.aggregate_w2s()` folds that into `data.state`.
+3. Free-text input is normalised (`"california"`, `"ca "`, `"D.C."` → `CA`/`DC`)
+   via `normalize_state`; unrecognised values pass through harmlessly (no pack
+   match → safe `$0` fallback).
+
+### High-accuracy modelling details (CA / NY / NJ / AZ)
+
+- **Social Security** is excluded for all four (correct — none tax it); the
+  federally-taxable SS amount is only injected for states flagged as taxing it.
+- **Pension / retirement income** is handled per state:
+  - **NY** — the $20,000 pension/annuity exclusion (Tax Law 612(c)(3-a)), gated
+    at age 59½.
+  - **NJ** — OTS ignores NJ capital gains and mis-handles its Schedule-1 line,
+    so NJ-taxable income is routed into the fields OTS taxes, and NJ's
+    income-limited retirement exclusion (54A:6-10, age 62+, phased across
+    $100k/$125k/$150k) **plus** the Other Retirement Income Exclusion
+    (54A:6-15, earned income ≤ $3,000) are computed in the adapter.
+- **Exact ages** come from optional `birth_date` / `spouse_birth_date` (age at
+  tax year-end), falling back to integer `age` then the 65+ booleans.
+- **Robustness** — if the engine errors or the dependency is missing, the pack
+  transparently falls back to its reference pack; the pipeline never fails.
+
+### Verification
+
+- **Parameter-level (done)** — CA/NY/NJ/AZ reconciled against official 2025
+  sources (FTB rate schedules + standard deduction + exemption credit; NY
+  IT-201 standard deduction and the >$107,650 tax-benefit recapture; NJ personal
+  exemption; AZ 2.5% flat + federal-conformed deduction). tenforty was
+  cross-checked against NBER TAXSIM, which confirmed the methodology
+  directionally; note TAXSIM's federal stops at 2023 and its recent-year state
+  law is an estimate, so it is not itself a 2025 oracle.
+- **End-to-end (pending)** — matching full returns against commercial tax
+  software is the remaining step for NY/NJ/AZ (CA is validated by tenforty
+  against professional software).
+
+### Adding a state
+
+- **Reference pack** — drop a `states/<state>_<year>.py` module that registers a
+  `FlatStatePack`, `BracketStatePack`, or a custom `StateRulePack`, then add it
+  to `states/__init__.py`.
+- **High-accuracy** — add a one-line `TenfortyStatePack(...)` registration in
+  `states/_tenforty_overrides.py` (tenforty's engine covers ~43 states).
 
 ---
 
@@ -331,6 +412,7 @@ backend/
       efile/           # EFileBackend protocol: pdf self-file + mock MeF transmitter
       chroma/ storage/ # vector store + file storage
     tax_rules/         # versioned, source-cited federal parameters + validation
+    state_rules/       # per-state rule-pack registry + tenforty high-accuracy backend
     workflow/          # LangGraph graph + shared state
     synthetic/         # ground-truth generators + the no-document demo
   tests/               # unit / integration / eval

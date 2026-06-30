@@ -55,12 +55,20 @@ def _map_document(doc: Any) -> dict[str, Any]:
     state_infos = fields.get("StateTaxInfos")
     if state_infos and getattr(state_infos, "value_array", None):
         total = Decimal("0")
+        primary_state = ""
+        most_tax = Decimal("-1")
         for item in state_infos.value_array:
-            tax = _amount((item.value_object or {}).get("StateIncomeTax"))
+            obj = item.value_object or {}
+            tax = _amount(obj.get("StateIncomeTax"))
             if tax is not None:
                 total += tax
+                if tax > most_tax:
+                    most_tax = tax
+                    primary_state = _content(obj.get("State"))
         if total > 0:
             out["box17_state_withheld"] = total
+        if primary_state:
+            out["box15_state"] = primary_state
 
     employer = _obj(fields.get("Employer"))
     employee = _obj(fields.get("Employee"))
