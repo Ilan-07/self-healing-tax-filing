@@ -9,6 +9,14 @@ independent verdicts (correctness *and* completeness), run a **bounded
 self-healing loop** when a check fails, and emit an official-style 1040 PDF with
 the supporting schedules the return actually used.
 
+Recent updates:
+- Optional Azure Document Intelligence W-2 extraction is wired in and falls
+  back cleanly to the offline parser when Azure is unavailable or rate-limited.
+- The downloadable report now uses a styled ReportLab layout instead of the
+  plain-text fallback.
+- The reading pipeline avoids repeated failing chat calls and focuses cloud W-2
+  extraction on the strongest candidate page in a document.
+
 The design principle throughout: **LLMs read and classify; deterministic code
 decides and computes.** Tax math is never authored by a model, and every
 monetary value on the return must be traceable to a source document.
@@ -78,6 +86,9 @@ execution is resumable and inspectable. The workflow status moves through
   (offline parser ↔ Azure Document Intelligence) and filing sits behind an
   `EFileBackend` protocol (self-file PDF ↔ simulated MeF transmitter). Both swap
   via a single environment variable.
+- **Polished PDF reporting.** The generated filing dossier is rendered with a
+  structured, multi-section ReportLab layout and a graceful PyMuPDF fallback if
+  ReportLab is missing.
 
 ---
 
@@ -120,6 +131,9 @@ execution is resumable and inspectable. The workflow status moves through
   sits behind a swappable adapter: the default `pdf` backend produces a self-file
   package, and `mock_transmitter` simulates a commercial MeF transmitter to
   demonstrate the swap.
+- **LLM-authored numbers.** Models are not allowed to invent tax values. The
+  local model is used for document reading/classification, and the workflow
+  degrades to deterministic paths when the model endpoint is missing or errors.
 
 ---
 
@@ -171,7 +185,7 @@ The taxpayer's state is **derived from the W-2** (box 15), not hand-set:
     (54A:6-15, earned income ≤ $3,000) are computed in the adapter.
 - **Exact ages** come from optional `birth_date` / `spouse_birth_date` (age at
   tax year-end), falling back to integer `age` then the 65+ booleans.
-- **Robustness** — if the engine errors or the dependency is missing, the pack
+- **Robustness** — if the engine errors, is missing, or rate-limits, the pack
   transparently falls back to its reference pack; the pipeline never fails.
 
 ### Verification
@@ -208,7 +222,7 @@ The taxpayer's state is **derived from the W-2** (box 15), not hand-set:
 | Tax engine | Pure-Python deterministic 1040 engine with versioned parameters |
 | Persistence | SQLAlchemy 2.x — **SQLite** by default, **PostgreSQL** via Docker |
 | Vector store | ChromaDB (embedded, or standalone via Docker) |
-| Reporting | ReportLab (line-numbered Form 1040 + conditional schedules) |
+| Reporting | ReportLab (styled filing dossier + line-numbered Form 1040 + conditional schedules) |
 | Frontend | React 18 + TypeScript + Vite |
 
 > Local-first: there is no hosted/proprietary LLM API dependency. Azure Document
@@ -283,7 +297,9 @@ docker compose up -d
 The W-2 extractor defaults to the offline `label` parser, which needs no cloud
 account. To swap in Azure's `prebuilt-tax.us.w2` model instead, you need an
 **endpoint** and an **API key** from an Azure Document Intelligence (formerly
-"Form Recognizer") resource. To get them:
+"Form Recognizer") resource. The Azure path is a thin adapter over the cloud
+W-2 model and falls back to the offline parser if the SDK, credentials, or
+service calls fail. To get the Azure credentials:
 
 1. Sign in to the [Azure Portal](https://portal.azure.com) (create a free
    account if you don't have one — Document Intelligence has a free `F0` tier).
@@ -310,6 +326,10 @@ account. To swap in Azure's `prebuilt-tax.us.w2` model instead, you need an
 
 Restart the backend to pick up the change. Either key works and they can be
 rotated independently in the portal; keep them out of version control.
+
+The cloud extractor is used only when `W2_EXTRACTOR=azure` and both Azure
+settings are present. The pipeline prefers the strongest W-2 page in a document
+to reduce latency and API calls.
 
 ---
 
