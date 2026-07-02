@@ -8,7 +8,12 @@ from typing import Any
 from app.schemas import AuditEntry, SourceEvidence, TaxpayerData, mask_ssn
 from app.services.chroma.service import ChromaService
 from app.services.documents.service import DocumentService
-from app.services.extraction import LabelAnchoredW2Parser, ParsedW2, W2Extractor
+from app.services.extraction import (
+    CloudW2Extractor,
+    LabelAnchoredW2Parser,
+    ParsedW2,
+    W2Extractor,
+)
 from app.services.extraction.base import BOX_TO_TAXPAYER_FIELD
 from app.services.extraction.info_returns import extract_information_returns
 from app.services.ocr.service import OCRService
@@ -136,6 +141,8 @@ class ReadingAgent:
         logs: list[AuditEntry] = []
         parsed_w2s: list[ParsedW2] = []
         info_totals: dict[str, tuple[Decimal, float]] = {}
+        best_cloud_candidate: tuple[int, str, Any] | None = None
+        best_cloud_score = -1
 
         for page in pages:
             image_ocr = self.ocr.extract(page.image, "")
@@ -200,10 +207,34 @@ class ReadingAgent:
                     },
                 )
             )
+            if isinstance(self.w2_extractor, CloudW2Extractor):
+                score = _cloud_w2_score(combined_text)
+                if score > best_cloud_score:
+                    best_cloud_score = score
+                    best_cloud_candidate = (page.number, ocr_text or combined_text, page.image)
+            else:
+                try:
+                    parsed_w2s.extend(
+                        self.w2_extractor.parse(
+                            ocr_text=ocr_text or combined_text, image=page.image
+                        )
+                    )
+                except NotImplementedError as exc:
+                    logs.append(
+                        AuditEntry(
+                            agent=self.name,
+                            action="extract_w2",
+                            reason="Configured W-2 extractor unavailable",
+                            details={"error": str(exc)},
+                        )
+                    )
+
+        if isinstance(self.w2_extractor, CloudW2Extractor) and best_cloud_candidate:
+            page_number, candidate_text, candidate_image = best_cloud_candidate
             try:
                 parsed_w2s.extend(
                     self.w2_extractor.parse(
-                        ocr_text=ocr_text or combined_text, image=page.image
+                        ocr_text=candidate_text, image=candidate_image
                     )
                 )
             except NotImplementedError as exc:
@@ -212,7 +243,7 @@ class ReadingAgent:
                         agent=self.name,
                         action="extract_w2",
                         reason="Configured W-2 extractor unavailable",
-                        details={"error": str(exc)},
+                        details={"page": page_number, "error": str(exc)},
                     )
                 )
 
@@ -397,3 +428,26 @@ def _dedupe_w2s(parsed: list[ParsedW2]) -> list[ParsedW2]:
         if key not in best or _w2_filled(pw.w2) > _w2_filled(best[key].w2):
             best[key] = pw
     return list(best.values())
+
+
+def _cloud_w2_score(text: str) -> int:
+    lower = text.lower()
+    score = 0
+    if "w-2" in lower or "wage and tax statement" in lower:
+        score += 8
+    for keyword in (
+        "employee's social security number",
+        "wages, tips, other compensation",
+        "federal income tax withheld",
+        "social security wages",
+        "social security tax withheld",
+        "medicare wages and tips",
+        "medicare tax withheld",
+        "employer identification number",
+    ):
+        if keyword in lower:
+            score += 3
+    for keyword in ("instructions for employee", "notice to employee"):
+        if keyword in lower:
+            score -= 5
+    return score

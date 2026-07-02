@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import Any, Callable
 
 from app.schemas import W2
+from app.schemas.tax import normalize_state
 from app.services.extraction.base import ParsedW2
 
 # Confidence we attribute to a cloud form model when it omits per-field scores.
@@ -27,6 +28,16 @@ ClientFn = Callable[[bytes], list[dict[str, Any]]]
 
 class CloudW2Extractor:
     name = "cloud_w2_model"
+
+    _NUMERIC_BOXES = {
+        "box1_wages",
+        "box2_federal_withheld",
+        "box3_ss_wages",
+        "box4_ss_withheld",
+        "box5_medicare_wages",
+        "box6_medicare_withheld",
+        "box17_state_withheld",
+    }
 
     def __init__(self, client: ClientFn | None = None):
         self.client = client
@@ -40,17 +51,26 @@ class CloudW2Extractor:
             )
         if image is None:
             return []
-        results = self.client(_to_png_bytes(image))
+        try:
+            results = self.client(_to_png_bytes(image))
+        except Exception as exc:
+            raise NotImplementedError(
+                f"Cloud W-2 extraction unavailable: {exc}"
+            ) from exc
         return [self._to_parsed(form) for form in results]
 
     def _to_parsed(self, form: dict[str, Any]) -> ParsedW2:
-        box_attrs = {
-            k: Decimal(str(v))
-            for k, v in form.items()
-            if k.startswith("box") and v not in (None, "")
-        }
+        box_attrs: dict[str, Decimal] = {}
+        for key in self._NUMERIC_BOXES:
+            value = _decimal_value(form.get(key))
+            if value is not None:
+                box_attrs[key] = value
         return ParsedW2(
-            w2=W2(employer_ein=str(form.get("employer_ein", "")), **box_attrs),
+            w2=W2(
+                employer_ein=str(form.get("employer_ein", "")),
+                box15_state=normalize_state(form.get("box15_state")),
+                **box_attrs,
+            ),
             employee_name=str(form.get("employee_name", "")),
             ssn=str(form.get("ssn", "")),
             tax_year=form.get("tax_year"),
@@ -61,7 +81,23 @@ class CloudW2Extractor:
         )
 
 
+def _decimal_value(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        value = value.replace("$", "").replace(",", "").strip()
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
 def _to_png_bytes(image: Any) -> bytes:
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
+    rgb = image.convert("RGB")
+    max_side = 1800
+    scale = min(max_side / max(rgb.size), 1.0)
+    if scale < 1:
+        rgb = rgb.resize((int(rgb.width * scale), int(rgb.height * scale)))
+    rgb.save(buffer, format="PNG")
     return buffer.getvalue()

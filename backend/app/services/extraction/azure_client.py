@@ -81,6 +81,15 @@ def _map_document(doc: Any) -> dict[str, Any]:
     return out
 
 
+def _numeric_value(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value).replace("$", "").replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+
+
 def _amount(field: Any) -> Decimal | None:
     if field is None:
         return None
