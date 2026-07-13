@@ -9,6 +9,29 @@ const money = (value?: string) =>
 
 const num = (value?: string) => Number(value ?? 0);
 
+// Plain-English, one-line summary of each agent action for the decision log.
+// Falls back to the backend's raw `reason` for any action not mapped here.
+const ACTION_SUMMARY: Record<string, string> = {
+  extract_page:
+    "Read each page with OCR + the local vision model, pulling out candidate figures.",
+  extract_w2:
+    "Parsed the W-2 boxes — wages, withholding, Social Security & Medicare.",
+  merge_documents:
+    "Merged all uploaded documents into a single return.",
+  index_document:
+    "Optional document indexing was unavailable — skipped it and continued.",
+  structure_json:
+    "Validated and structured every extracted value against the tax-data schema.",
+  calculate_tax:
+    "Computed the full Form 1040 — income, deductions, tax, credits, and refund/balance — deterministically.",
+  verify_submission:
+    "Independently recomputed the return and checked grounding, W-2 invariants, and completeness.",
+  remediate:
+    "Applied bounded corrections (or requested a sharper re-read) and re-ran the pipeline.",
+  generate_pdf:
+    "Generated the final 1040 PDF, routed it to the e-file boundary, and issued a receipt.",
+};
+
 const CHECK_LABELS: Record<string, string> = {
   taxpayer_name: "Taxpayer name",
   taxpayer_ssn: "Taxpayer SSN",
@@ -189,7 +212,7 @@ export function ResultPanel({ result }: { result: SubmissionResult }) {
             <span>{String(index + 1).padStart(2, "0")}</span>
             <div>
               <strong>{entry.agent}</strong>
-              <p>{entry.reason}</p>
+              <p>{ACTION_SUMMARY[entry.action] ?? entry.reason}</p>
             </div>
             <code>{entry.action}</code>
           </div>

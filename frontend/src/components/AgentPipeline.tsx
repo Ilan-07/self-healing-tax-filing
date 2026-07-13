@@ -1,5 +1,3 @@
-import { useEffect, useState } from "react";
-
 const agents = [
   ["01", "Reading", "OCR + vision"],
   ["02", "Tax Processing", "Rule engine"],
@@ -9,7 +7,9 @@ const agents = [
 ];
 
 // The backend persists a single "processing" status until the run is terminal,
-// so we show an indeterminate scanner (not a faked per-stage stepper).
+// so we deliberately show an HONEST indeterminate bar rather than pretending to
+// track a per-stage cursor (which would imply progress the API never reports,
+// e.g. lighting up Remediation on every run when it only fires on failure).
 const RUNNING = new Set([
   "processing",
   "parsing",
@@ -22,39 +22,32 @@ export function AgentPipeline({ status }: { status?: string }) {
   const running = !!status && RUNNING.has(status);
   const done = status === "completed";
   const halted = status === "manual_review" || status === "failed";
-  const [cursor, setCursor] = useState(0);
-
-  useEffect(() => {
-    if (!running) return;
-    const id = setInterval(
-      () => setCursor((c) => (c + 1) % agents.length),
-      1600,
-    );
-    return () => clearInterval(id);
-  }, [running]);
 
   return (
     <section
-      className={`pipeline${running ? " running" : ""}${halted ? " halted" : ""}`}
+      className="pipeline-wrap"
       aria-label="Agent workflow"
       aria-live="polite"
     >
-      {agents.map(([number, title, subtitle], index) => {
-        const cls = done
-          ? "active"
-          : running && index === cursor
-            ? "scan"
-            : "";
-        return (
-          <div className={`agent-card ${cls}`} key={title}>
+      <div
+        className={`pipeline${running ? " running" : ""}${halted ? " halted" : ""}`}
+      >
+        {agents.map(([number, title, subtitle]) => (
+          <div className={`agent-card ${done ? "active" : ""}`} key={title}>
             <span className="agent-number">{number}</span>
             <div>
               <strong>{title}</strong>
-              <small>{cls === "scan" ? "working…" : subtitle}</small>
+              <small>{subtitle}</small>
             </div>
           </div>
-        );
-      })}
+        ))}
+      </div>
+      {running && (
+        <div className="pipeline-status" role="status">
+          <div className="pipeline-bar" aria-hidden="true" />
+          <small>Agents working — extracting, computing, and verifying…</small>
+        </div>
+      )}
     </section>
   );
 }

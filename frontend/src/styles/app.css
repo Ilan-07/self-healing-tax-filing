@@ -84,31 +84,41 @@ nav {
 }
 .agent-card:last-child { border-right: 0; }
 .agent-card.active { background: var(--ink); color: white; opacity: 1; }
-.agent-card.scan {
-  background: #1b2c20; color: white; opacity: 1;
-  animation: scanPulse 1.6s ease-in-out infinite;
-}
+/* During a run every stage is uniformly "engaged" — no single card is singled
+   out as active, because the API does not report which stage is running. */
+.pipeline.running .agent-card { opacity: .82; }
 .agent-number { color: var(--green); font: 500 12px var(--mono); }
-.active .agent-number, .scan .agent-number { color: var(--lime); }
+.active .agent-number { color: var(--lime); }
 .agent-card strong, .agent-card small { display: block; }
 .agent-card strong { font-size: 13px; }
 .agent-card small { margin-top: 5px; opacity: .65; font-size: 11px; }
-@keyframes scanPulse {
-  0%, 100% { box-shadow: inset 0 -2px 0 0 rgba(200, 242, 74, 0); }
-  50% { box-shadow: inset 0 -3px 0 0 var(--lime); }
-}
-.pipeline.running { position: relative; }
-.pipeline.running::after {
-  content: ""; position: absolute; left: 0; top: 0; height: 2px;
-  width: 100%; background: linear-gradient(90deg, transparent, var(--lime), transparent);
-  background-size: 40% 100%; background-repeat: no-repeat;
-  animation: pipelineSweep 1.6s linear infinite;
-}
-@keyframes pipelineSweep {
-  0% { background-position: -40% 0; }
-  100% { background-position: 140% 0; }
-}
 .pipeline.halted { border-color: #d65b3c; }
+
+/* Honest indeterminate progress: a single lime bar sweeping under the row,
+   with a plain caption. No percentage, no faked per-stage stepping. */
+.pipeline-status {
+  display: flex; align-items: center; gap: 14px; margin-top: 14px;
+}
+.pipeline-bar {
+  position: relative; flex: 1; height: 3px; border-radius: 999px;
+  background: var(--line); overflow: hidden;
+}
+.pipeline-bar::after {
+  content: ""; position: absolute; top: 0; left: -38%; height: 100%; width: 38%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, transparent, var(--lime), transparent);
+  animation: pipelineIndeterminate 1.3s ease-in-out infinite;
+}
+@keyframes pipelineIndeterminate {
+  0% { left: -38%; }
+  100% { left: 100%; }
+}
+.pipeline-status small {
+  font: 500 12px var(--mono); color: var(--green); white-space: nowrap;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pipeline-bar::after { animation: none; left: 0; width: 100%; opacity: .6; }
+}
 
 .workspace {
   display: grid; grid-template-columns: 1.45fr .55fr; gap: 24px;
