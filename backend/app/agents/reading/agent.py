@@ -335,7 +335,13 @@ class ReadingAgent:
 
         regex_values = self._regex_extract(raw_text)
         for key, value in regex_values.items():
-            if merged.get(key) in (None, ""):
+            # Regex is a last-resort fallback: never let it overwrite a value a
+            # structured extractor (W-2 boxes / info returns) already grounded --
+            # doing so would clobber that source's higher confidence with 0.72.
+            # W-2 scalars (wages/withholding) are folded in later by
+            # aggregate_w2s(), so `merged[key]` is still empty here even though
+            # the field is already grounded via `confidences`.
+            if merged.get(key) in (None, "") and key not in confidences:
                 merged[key] = value
                 confidences[key] = 0.72
                 evidence.append(
